@@ -1,0 +1,7 @@
+{
+  "name": "DSP_Planner_Export",
+  "version_number": "1.8.0",
+  "website_url": "https://github.com/Skieller-Software/dsp-planner-plugin",
+  "description": "Serves live game state to the DSP Ultimate Suite planner over localhost: research, production rates, and blueprint protos.",
+  "dependencies": ["BepInEx-BepInExPack-5.4.2100"]
+}

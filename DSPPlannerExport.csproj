@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>DSPPlannerExport</AssemblyName>
+    <Version>1.8.0</Version>
+    <LangVersion>latest</LangVersion>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+
+    <!-- EDIT THIS PATH to match your install, or pass it on the command line:
+         dotnet build -c Release -p:DSPManaged="D:\...\DSPGAME_Data\Managed"
+         BepInEx + Harmony come from the official BepInEx NuGet feed (see nuget.config),
+         so only the game install path is machine-specific. -->
+    <DSPManaged Condition="'$(DSPManaged)'==''">C:\Program Files (x86)\Steam\steamapps\common\Dyson Sphere Program\DSPGAME_Data\Managed</DSPManaged>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- lets net472 build with only the .NET (Core) SDK installed, no Framework targeting pack needed -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <!-- BepInEx 5 + HarmonyX (0Harmony), compile-time only: the game's BepInEx install
+         provides them at runtime, so nothing is copied next to the plugin DLL -->
+    <PackageReference Include="BepInEx.Core" Version="5.4.21" IncludeAssets="compile" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- game + engine assemblies: referenced (never modified) from the local install;
+         DSP runs Unity 2022.3, for which no UnityEngine.Modules NuGet package exists -->
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(DSPManaged)\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(DSPManaged)\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(DSPManaged)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- IMGUI (OnGUI/GUI/GUIStyle) for the in-game live-deficit HUD overlay -->
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>$(DSPManaged)\UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- FontStyle / TextAnchor used by the HUD GUIStyles -->
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>$(DSPManaged)\UnityEngine.TextRenderingModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
