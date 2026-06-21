@@ -49,6 +49,8 @@ The HTTP thread never touches Unity objects — the main thread refreshes JSON s
 fetches `http://localhost` from the planner because the plugin sends
 `Access-Control-Allow-Origin: *`.
 
+**Building your own tool?** See the [integration guide](INTEGRATION.md) for the full endpoint contract (payloads, CORS, SSE, detection).
+
 ## Build from source
 CI can't build this (it needs the game's assemblies), so releases are built locally.
 
