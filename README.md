@@ -42,6 +42,8 @@ game running:
 | `GET /state`   | researched tech / upgrade levels |
 | `GET /protos`  | full item/building proto dump (footprints, z-step, sorter slots) |
 | `GET /rates`   | cumulative production/consumption counters (→ items/min) |
+| `GET /research`| current research + queue (live research-timeline feed) |
+| `GET /power`   | per-planet power grid: capacity, draw, stored energy |
 | `GET /deficits`, `/events` (SSE), `/config` | live deficits, push updates, settings |
 
 The HTTP thread never touches Unity objects — the main thread refreshes JSON snapshots

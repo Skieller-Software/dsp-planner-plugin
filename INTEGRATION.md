@@ -102,6 +102,29 @@ Per tech: `id`, `name`, level span, `hash`/`hashByLevel`, real prerequisite edge
 (`items` + `points`, total cost ≈ `points * hash / 3600`) and `preItem` (items needed
 before the game reveals the tech). Useful for research planning / tree auditing.
 
+### `GET /research` — current research & queue  *(version 1)*
+What's being researched right now and what's queued behind it — the live feed for a
+research-timeline planner.
+```json
+{ "version": 1, "running": true, "current": 1602,
+  "hashUploaded": 1840, "hashNeeded": 5400, "level": 3,
+  "queue": [1603, 1604, 1112] }
+```
+`current` is the active tech id (`0` if none); `hashUploaded`/`hashNeeded`/`level` are
+present only while a tech is active (`level` is the next level for repeatable techs).
+`queue` lists the upcoming tech ids in order. Pair with `/techs` for names and costs.
+
+### `GET /power` — per-planet power grid  *(version 1)*
+Generation capacity, draw and stored (accumulator) energy summed across each planet's
+power networks — "plan vs actual" for the power planner.
+```json
+{ "version": 1, "running": true,
+  "planets": [ { "planet": 102000601, "name": "Planet of Misery",
+                 "capacity": 7200000, "consumption": 5130000, "stored": 18000000 } ] }
+```
+Energies are **per-tick** (×60 ≈ per second); the planner converts. Only planets with a
+power system report; `planets` is empty until a save is loaded.
+
 ### `GET /events` — Server-Sent Events push
 Streams `event: state` / `event: rates` with the **same JSON payloads** as the endpoints
 above, but only when a snapshot **changes** (checked ~once/second), plus `: keepalive`

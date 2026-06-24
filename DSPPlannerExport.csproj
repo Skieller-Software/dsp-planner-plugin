@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net472</TargetFramework>
     <AssemblyName>DSPPlannerExport</AssemblyName>
-    <Version>1.8.0</Version>
+    <Version>1.10.0</Version>
     <LangVersion>latest</LangVersion>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <EnableDefaultCompileItems>true</EnableDefaultCompileItems>

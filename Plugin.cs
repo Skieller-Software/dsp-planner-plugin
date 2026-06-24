@@ -59,7 +59,7 @@ namespace DSPPlannerExport
     {
         public const string GUID = "dev.ski.dspplannerexport";
         public const string NAME = "DSP Planner Export";
-        public const string VERSION = "1.8.0";
+        public const string VERSION = "1.10.0";
         private const int Port = 8765;
 
         private HttpListener _listener;
@@ -71,9 +71,17 @@ namespace DSPPlannerExport
         // serves the latest string.
         private volatile string _snapshot = "{\"version\":1,\"running\":false,\"states\":[]}";
         private volatile string _rates = "{\"version\":1,\"running\":false,\"gameTick\":0,\"items\":[]}";
-        private volatile string _protos = null;   // static item protos (built once)
-        private volatile string _techs = null;    // static tech protos (built once)
+        private volatile string _protos = null;   // static item protos (built + cached once localization is ready)
+        private volatile string _techs = null;    // static tech protos (built + cached once localization is ready)
+        // T66: the game's name strings come from lazy caches that, when first touched at the
+        // main menu, return PRE-localization names. Set true on the main thread once a save is
+        // actually loaded (localization applied); the HTTP thread only ever READS it and will
+        // not permanently cache /protos or /techs until it is true, so a menu-time pull can
+        // never bake the wrong strings into the cache.
+        private volatile bool _locReady = false;
         private volatile string _deficits = "{\"version\":1,\"running\":false,\"items\":[]}";
+        private volatile string _research = "{\"version\":1,\"running\":false}";   // #26: current research + queue
+        private volatile string _power = "{\"version\":1,\"running\":false,\"planets\":[]}";   // #27: per-planet power grid
         private int _frame;
 
         // --- live deficit detection (in-game HUD + planner card share ONE computation) ---
@@ -92,6 +100,10 @@ namespace DSPPlannerExport
         private ConfigEntry<Corner> _cfgCorner;
         private ConfigEntry<bool> _cfgShowPending;
         private ConfigEntry<float> _cfgHudX, _cfgHudY;   // dragged position (-1 = use Corner)
+        // T99 advisor: surface researched building-tier upgrades in the HUD, configurable per kind
+        private ConfigEntry<bool> _cfgAdvisor, _cfgAdvBelts, _cfgAdvSorters, _cfgAdvMachines, _cfgAdvProlif;
+        private ConfigEntry<KeyboardShortcut> _cfgAdvAckKey;
+        private ConfigEntry<string> _cfgAdvAcked;   // internal: comma-separated item ids already dismissed
         private System.IO.FileSystemWatcher _cfgWatcher;
 
         private string[] _itemName;               // id -> display name (built once in-game)
@@ -103,6 +115,24 @@ namespace DSPPlannerExport
         private readonly List<Snap> _snaps = new List<Snap>();
         private struct DefRow { public int id; public string name; public float prod, cons, net; public int streak; public bool flagged; }
         private volatile DefRow[] _hudRows = new DefRow[0];
+        // T99 advisor — tier-up chains by config kind. Authoritative DSP proto ids (match the
+        // codec's idmaps); Dark-Fog-only tiers (recomposing/negentropy/self-evolution) are
+        // omitted on purpose — they're enemy drops, not a research path. The advisor flags the
+        // highest UNLOCKED tier above the base, mirroring the in-app advisor (32-advisor.js).
+        private struct Chain { public string kind; public int[] ids; public Chain(string k, int[] i) { kind = k; ids = i; } }
+        private static readonly Chain[] UpgradeChains =
+        {
+            new Chain("Belts",        new[]{ 2001, 2002, 2003 }),
+            new Chain("Sorters",      new[]{ 2011, 2012, 2013, 2014 }),
+            new Chain("Machines",     new[]{ 2303, 2304, 2305 }),   // assemblers
+            new Chain("Machines",     new[]{ 2302, 2315 }),          // smelters (arc -> plane)
+            new Chain("Machines",     new[]{ 2309, 2317 }),          // chemical plants
+            new Chain("Machines",     new[]{ 2301, 2316 }),          // miners
+            new Chain("Proliferator", new[]{ 1141, 1142, 1143 }),
+        };
+        private struct Advice { public int id; public string text; }
+        private static readonly Advice[] _noAdvice = new Advice[0];
+        private volatile Advice[] _advice = _noAdvice;
         private volatile bool _inGame;
         private bool _hudVisible = true;
         private bool _dragging;
@@ -129,6 +159,14 @@ namespace DSPPlannerExport
                 "Also list items dipping but not yet sustained (dimmed, with their streak) so the HUD matches the planner card. Off = show only flagged deficits.");
             _cfgHudX = Config.Bind("HUD", "HudX", -1f, "HUD pixel X of the top-left corner. -1 = anchor to Corner. Set by dragging the HUD in-game.");
             _cfgHudY = Config.Bind("HUD", "HudY", -1f, "HUD pixel Y of the top-left corner. -1 = anchor to Corner. Set by dragging the HUD in-game.");
+            // T99 advisor — researched-upgrade tips in the HUD; the player picks which kinds show.
+            _cfgAdvisor = Config.Bind("Advisor", "Enabled", true, "Show 'researched upgrade available' tips in the HUD when a higher building tier unlocks (e.g. Mk.II belts). Mirrors the planner's 💡 Advisor.");
+            _cfgAdvBelts = Config.Bind("Advisor", "Belts", true, "Advise when a higher Conveyor Belt tier is researched.");
+            _cfgAdvSorters = Config.Bind("Advisor", "Sorters", true, "Advise when a higher Sorter tier is researched.");
+            _cfgAdvMachines = Config.Bind("Advisor", "Machines", true, "Advise when a higher Assembler / Smelter / Chemical Plant / Mining Machine tier is researched.");
+            _cfgAdvProlif = Config.Bind("Advisor", "Proliferator", true, "Advise when a higher Proliferator Mk is researched.");
+            _cfgAdvAckKey = Config.Bind("Advisor", "DismissKey", new KeyboardShortcut(KeyCode.F9), "Hotkey to dismiss the current advisor tips (each reappears only when a still-newer tier unlocks).");
+            _cfgAdvAcked = Config.Bind("Advisor", "Acknowledged", "", "Internal: comma-separated item ids already dismissed. Managed by DismissKey.");
             _hudVisible = _cfgEnabled.Value;
 
             // BepInEx does not apply external .cfg edits on its own — watch the file so
@@ -164,7 +202,7 @@ namespace DSPPlannerExport
                 _running = true;
                 _thread = new Thread(ServeLoop) { IsBackground = true, Name = "DSPPlannerExport" };
                 _thread.Start();
-                Logger.LogInfo($"DSP Planner Export: serving http://localhost:{Port}/state, /protos, /techs, /rates, /deficits, /config");
+                Logger.LogInfo($"DSP Planner Export: serving http://localhost:{Port}/state, /protos, /techs, /rates, /deficits, /research, /power, /config");
             }
             catch (Exception e)
             {
@@ -177,13 +215,76 @@ namespace DSPPlannerExport
         private void Update()
         {
             if (_cfgToggle.Value.IsDown()) _hudVisible = !_hudVisible;
+            if (_cfgAdvAckKey.Value.IsDown()) AcknowledgeAdvice();
             if (++_frame % 60 != 0) return; // roughly once per second
+            // T66: once a save is actually loaded, the game's name strings are localized.
+            // Flip the gate (main thread, so touching GameMain is safe) and discard any
+            // protos/techs the HTTP thread may have built fresh at the menu, so the next
+            // pull rebuilds + caches with the correct localized names.
+            if (!_locReady && GameMain.instance != null && GameMain.data != null && !DSPGame.IsMenuDemo)
+            { _locReady = true; _protos = null; _techs = null; }
             try { _snapshot = BuildJson(); }
             catch (Exception e) { Logger.LogWarning("DSP Planner Export: snapshot error " + e.Message); }
             try { _rates = BuildRates(); }
             catch (Exception e) { Logger.LogWarning("DSP Planner Export: rates error " + e.Message); }
             try { ComputeDeficits(); }
             catch (Exception e) { Logger.LogWarning("DSP Planner Export: deficit error " + e.Message); }
+            try { _research = BuildResearch(); }
+            catch (Exception e) { Logger.LogWarning("DSP Planner Export: research error " + e.Message); }
+            try { _power = BuildPower(); }
+            catch (Exception e) { Logger.LogWarning("DSP Planner Export: power error " + e.Message); }
+            try { ComputeAdvice(); }
+            catch (Exception e) { Logger.LogWarning("DSP Planner Export: advice error " + e.Message); }
+        }
+
+        // T99: which researched tier-ups to advise — the highest UNLOCKED tier above the base in
+        // each enabled chain, minus the ids the player has already dismissed (DismissKey).
+        private bool AdvKindEnabled(string kind)
+        {
+            switch (kind)
+            {
+                case "Belts": return _cfgAdvBelts.Value;
+                case "Sorters": return _cfgAdvSorters.Value;
+                case "Machines": return _cfgAdvMachines.Value;
+                case "Proliferator": return _cfgAdvProlif.Value;
+                default: return true;
+            }
+        }
+        private HashSet<int> AckedSet()
+        {
+            var set = new HashSet<int>();
+            var raw = _cfgAdvAcked.Value;
+            if (!string.IsNullOrEmpty(raw))
+                foreach (var p in raw.Split(',')) if (int.TryParse(p.Trim(), out int v)) set.Add(v);
+            return set;
+        }
+        private void ComputeAdvice()
+        {
+            if (!_cfgAdvisor.Value || GameMain.instance == null || GameMain.history == null || DSPGame.IsMenuDemo) { _advice = _noAdvice; return; }
+            var acked = AckedSet();
+            var list = new List<Advice>();
+            foreach (var ch in UpgradeChains)
+            {
+                if (!AdvKindEnabled(ch.kind)) continue;
+                int top = -1;
+                for (int i = 0; i < ch.ids.Length; i++)
+                    if (GameMain.history.ItemUnlocked(ch.ids[i])) top = i;
+                if (top <= 0) continue;                  // only the base tier unlocked -> nothing to suggest
+                int topId = ch.ids[top];
+                if (acked.Contains(topId)) continue;      // already dismissed this tier
+                var proto = LDB.items.Select(topId);
+                list.Add(new Advice { id = topId, text = proto != null ? proto.name : ("item " + topId) });
+            }
+            _advice = list.ToArray();
+        }
+        private void AcknowledgeAdvice()
+        {
+            var adv = _advice;
+            if (adv.Length == 0) return;
+            var acked = AckedSet();
+            foreach (var a in adv) acked.Add(a.id);
+            _cfgAdvAcked.Value = string.Join(",", acked);
+            _advice = _noAdvice;
         }
 
         private void ServeLoop()
@@ -214,16 +315,16 @@ namespace DSPPlannerExport
                     string body;
                     if (path.EndsWith("/protos"))
                     {
-                        if (_protos == null) { try { _protos = BuildProtos(); } catch (Exception e) { _protos = "{\"items\":[]}"; Logger.LogWarning("protos error " + e.Message); } }
-                        body = _protos;
+                        body = GetStaticProtos();
                     }
                     else if (path.EndsWith("/techs"))
                     {
-                        if (_techs == null) { try { _techs = BuildTechs(); } catch (Exception e) { _techs = "{\"version\":1,\"techs\":[]}"; Logger.LogWarning("techs error " + e.Message); } }
-                        body = _techs;
+                        body = GetStaticTechs();
                     }
                     else if (path.EndsWith("/rates")) body = _rates;
                     else if (path.EndsWith("/deficits")) body = _deficits;
+                    else if (path.EndsWith("/research")) body = _research;   // #26
+                    else if (path.EndsWith("/power")) body = _power;         // #27
                     else if (path.EndsWith("/config"))
                     {
                         if (ctx.Request.HttpMethod == "POST")
@@ -302,6 +403,95 @@ namespace DSPPlannerExport
             }
             sb.Append("]}");
             return sb.ToString();
+        }
+
+        // #26: live research progress — the tech being researched, its hash progress, and
+        // the queue → feeds the research timeline (#3) ETA and "in progress, N% / queued"
+        // in the tech inspector. (Field names match current DSP builds; adjust on a patch.)
+        private static string BuildResearch()
+        {
+            var sb = new StringBuilder(512);
+            bool inGame = GameMain.instance != null && GameMain.history != null && !DSPGame.IsMenuDemo;
+            sb.Append("{\"version\":1,\"running\":").Append(inGame ? "true" : "false");
+            if (inGame)
+            {
+                var h = GameMain.history;
+                int cur = h.currentTech;
+                sb.Append(",\"current\":").Append(cur);
+                if (cur > 0 && h.techStates != null && h.techStates.ContainsKey(cur))
+                {
+                    var st = h.techStates[cur];
+                    sb.Append(",\"hashUploaded\":").Append(st.hashUploaded)
+                      .Append(",\"hashNeeded\":").Append(st.hashNeeded)
+                      .Append(",\"level\":").Append(st.curLevel);
+                }
+                sb.Append(",\"queue\":[");
+                var q = h.techQueue;
+                if (q != null)
+                {
+                    int n = h.techQueueLength, w = 0;
+                    for (int i = 0; i < n && i < q.Length; i++) { if (q[i] <= 0) continue; if (w++ > 0) sb.Append(','); sb.Append(q[i]); }
+                }
+                sb.Append(']');
+            }
+            sb.Append('}');
+            return sb.ToString();
+        }
+
+        // #27: per-planet power-grid stats — generation capacity, consumption and stored
+        // (accumulator) energy summed across each planet's power networks → "plan vs actual"
+        // for the power card. Energies are per-tick (×60 ≈ /s); the planner converts.
+        private static string BuildPower()
+        {
+            var sb = new StringBuilder(2048);
+            bool inGame = GameMain.instance != null && GameMain.data != null && !DSPGame.IsMenuDemo;
+            sb.Append("{\"version\":1,\"running\":").Append(inGame ? "true" : "false").Append(",\"planets\":[");
+            if (inGame)
+            {
+                var factories = GameMain.data.factories;
+                bool first = true;
+                for (int f = 0; f < GameMain.data.factoryCount; f++)
+                {
+                    var fac = factories[f]; if (fac == null || fac.powerSystem == null || fac.planet == null) continue;
+                    long capacity = 0, consumption = 0, stored = 0;
+                    var ps = fac.powerSystem;
+                    for (int i = 1; i < ps.netCursor; i++)
+                    {
+                        var net = ps.netPool[i]; if (net == null) continue;
+                        capacity += net.energyCapacity;
+                        consumption += net.energyServed;
+                        stored += net.energyStored;
+                    }
+                    if (!first) sb.Append(','); first = false;
+                    sb.Append("{\"planet\":").Append(fac.planet.id)
+                      .Append(",\"name\":\"").Append(JsonEscape(fac.planet.displayName ?? ""))
+                      .Append("\",\"capacity\":").Append(capacity)
+                      .Append(",\"consumption\":").Append(consumption)
+                      .Append(",\"stored\":").Append(stored).Append('}');
+                }
+            }
+            sb.Append("]}");
+            return sb.ToString();
+        }
+
+        // T66: serve the static protos/techs, but only PERMANENTLY cache them once
+        // localization is ready (_locReady). Before a save loads, the game's lazy name
+        // caches can return pre-localization strings, so we build a fresh (uncached)
+        // best-effort response at the menu and let a later in-game pull build the real,
+        // cached one. (BuildProtos/BuildTechs read only LDB static data — safe off-thread.)
+        private string GetStaticProtos()
+        {
+            if (_protos != null) return _protos;
+            string p; try { p = BuildProtos(); } catch (Exception e) { Logger.LogWarning("protos error " + e.Message); return "{\"items\":[]}"; }
+            if (_locReady) _protos = p;
+            return p;
+        }
+        private string GetStaticTechs()
+        {
+            if (_techs != null) return _techs;
+            string t; try { t = BuildTechs(); } catch (Exception e) { Logger.LogWarning("techs error " + e.Message); return "{\"version\":1,\"techs\":[]}"; }
+            if (_locReady) _techs = t;
+            return t;
         }
 
         // Full item proto dump: every item gets id, name and inventory grid index;
@@ -634,8 +824,11 @@ namespace DSPPlannerExport
         // Reads only the cached _hudRows snapshot (never game logic), so it is GUI-thread safe.
         private void OnGUI()
         {
-            if (!_cfgEnabled.Value || !_hudVisible || !_inGame) return;
-            var rows = _hudRows;
+            if (!_hudVisible || !_inGame) return;
+            bool showDef = _cfgEnabled.Value;
+            var adv = _cfgAdvisor.Value ? _advice : _noAdvice;
+            if (!showDef && adv.Length == 0) return;   // HUD off and no advice -> nothing to draw
+            var rows = showDef ? _hudRows : new DefRow[0];
             bool showPending = _cfgShowPending.Value;
             // Mirror the planner card: by default list every dipping item (flagged +
             // pending), so the two surfaces agree. ShowPending=false = flagged only.
@@ -658,8 +851,9 @@ namespace DSPPlannerExport
             _titleStyle.fontSize = fs; _rowStyle.fontSize = fs;
             float pad = 10 * s, accent = 4 * s, rowH = fs + 8, w = 300 * s, margin = 14 * s;
             int cap = Math.Max(1, _cfgMaxRows.Value);
-            int bodyRows = total > 0 ? Math.Min(total, cap) : 1;
-            float h = pad * 2 + rowH * (bodyRows + 1); // +1 for the title row
+            int defRows = showDef ? (1 + (total > 0 ? Math.Min(total, cap) : 1)) : 0;   // title + rows (or the no-deficits line)
+            int advRows = adv.Length > 0 ? adv.Length + 1 : 0;                            // advisor header + lines
+            float h = pad * 2 + rowH * Math.Max(1, defRows + advRows);
             var corner = _cfgCorner.Value;
             bool left = corner == Corner.TopLeft || corner == Corner.BottomLeft;
             bool top = corner == Corner.TopLeft || corner == Corner.TopRight;
@@ -706,28 +900,43 @@ namespace DSPPlannerExport
                 GUI.Label(new Rect(tx, y, tw, rowH), text, st);
             }
 
-            if (total == 0)
+            // Deficit section (only when the deficit HUD is enabled).
+            // ▲/✓ are in Unity's built-in Arial; ⚠ (U+26A0) and emoji often aren't -> avoid tofu.
+            if (showDef)
             {
-                L(ty, "✓ No deficits", new Color(0.55f, 0.95f, 0.6f), _titleStyle);
-                GUI.color = saved;
-                return;
+                if (total == 0)
+                {
+                    L(ty, "✓ No deficits", new Color(0.55f, 0.95f, 0.6f), _titleStyle);
+                    ty += rowH;
+                }
+                else
+                {
+                    // Red alert when something is sustained; a calmer note when items are only dipping.
+                    L(ty, flaggedN > 0 ? "▲ Live deficits (" + flaggedN + ")" : "Dipping — none sustained",
+                      flaggedN > 0 ? new Color(1f, 0.78f, 0.32f) : new Color(0.92f, 0.94f, 1f), _titleStyle);
+                    ty += rowH;
+                    var red = new Color(1f, 0.5f, 0.42f);
+                    var pend = new Color(0.9f, 0.92f, 0.97f);
+                    int drawn = 0;
+                    for (int i = 0; i < rows.Length && drawn < cap; i++)
+                    {
+                        var r = rows[i];
+                        if (!r.flagged && !showPending) continue;
+                        string txt = r.name + "   " + r.net.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "/min"
+                                   + (r.flagged ? "" : "  (" + r.streak + "s)");
+                        L(ty, txt, r.flagged ? red : pend, _rowStyle);
+                        ty += rowH; drawn++;
+                    }
+                }
             }
-            // Red alert when something is sustained; a calmer note when items are only dipping.
-            // ▲/✓ are in Unity's built-in Arial; ⚠ (U+26A0) often isn't -> avoid tofu.
-            L(ty, flaggedN > 0 ? "▲ Live deficits (" + flaggedN + ")" : "Dipping — none sustained",
-              flaggedN > 0 ? new Color(1f, 0.78f, 0.32f) : new Color(0.92f, 0.94f, 1f), _titleStyle);
-            ty += rowH;
-            var red = new Color(1f, 0.5f, 0.42f);
-            var pend = new Color(0.9f, 0.92f, 0.97f);
-            int drawn = 0;
-            for (int i = 0; i < rows.Length && drawn < cap; i++)
+            // T99 advisor section: researched tier-ups the player hasn't dismissed yet.
+            if (adv.Length > 0)
             {
-                var r = rows[i];
-                if (!r.flagged && !showPending) continue;
-                string txt = r.name + "   " + r.net.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "/min"
-                           + (r.flagged ? "" : "  (" + r.streak + "s)");
-                L(ty, txt, r.flagged ? red : pend, _rowStyle);
-                ty += rowH; drawn++;
+                string keyName = _cfgAdvAckKey.Value.MainKey.ToString();
+                L(ty, "Upgrades available (" + keyName + " to dismiss)", new Color(1f, 0.85f, 0.4f), _titleStyle);
+                ty += rowH;
+                var advCol = new Color(0.75f, 0.95f, 1f);
+                foreach (var a in adv) { L(ty, "+ " + a.text + " researched", advCol, _rowStyle); ty += rowH; }
             }
             GUI.color = saved;
         }
